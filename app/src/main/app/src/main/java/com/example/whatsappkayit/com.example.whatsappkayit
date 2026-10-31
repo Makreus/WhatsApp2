@@ -1,0 +1,211 @@
+package com.example.whatsappkayit
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.util.Log
+import android.widget.Toast
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class RecorderService : Service() {
+
+    companion object {
+        const val ACTION_START = "com.example.whatsappkayit.START"
+        const val ACTION_STOP = "com.example.whatsappkayit.STOP"
+        const val EXTRA_RESULT_CODE = "result_code"
+        const val EXTRA_DATA = "data"
+
+        private const val CHANNEL_ID = "kayit"
+        private const val NOTIF_ID = 1
+        private const val TAG = "RecorderService"
+
+        @Volatile var kayitVar = false
+            private set
+        var onDurumDegisti: (() -> Unit)? = null
+    }
+
+    private var projection: MediaProjection? = null
+    private var recorder: MediaRecorder? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var pfd: ParcelFileDescriptor? = null
+    private var dosyaUri: Uri? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> baslat(intent)
+            ACTION_STOP -> durdur()
+            else -> stopSelf()
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun bildirimHazirla(): Notification {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Kayıt", NotificationManager.IMPORTANCE_LOW)
+        )
+        val durdurIntent = PendingIntent.getService(
+            this, 0,
+            Intent(this, RecorderService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Kayıt yapılıyor")
+            .setContentText("Durdurmak için dokun")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setContentIntent(durdurIntent)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun baslat(intent: Intent) {
+        if (kayitVar) return
+
+        // Android 14+: getMediaProjection'dan ÖNCE foreground service başlamış olmalı.
+        val tip = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        startForeground(NOTIF_ID, bildirimHazirla(), tip)
+
+        try {
+            val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+            val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+            else
+                @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_DATA)
+            if (data == null) throw IllegalStateException("İzin verisi yok")
+
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val mp = mpm.getMediaProjection(resultCode, data)
+            // Android 14+: createVirtualDisplay'den önce callback kaydı zorunlu.
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Handler(Looper.getMainLooper()).post { durdur() }
+                }
+            }, Handler(Looper.getMainLooper()))
+            projection = mp
+
+            // Ekran boyutu: genişliği en fazla 720'ye indir, çift sayıya yuvarla.
+            val dm = resources.displayMetrics
+            val oran = if (dm.widthPixels > 720) 720f / dm.widthPixels else 1f
+            val w = ((dm.widthPixels * oran).toInt() / 2) * 2
+            val h = ((dm.heightPixels * oran).toInt() / 2) * 2
+
+            val uri = yeniDosyaOlustur()
+            dosyaUri = uri
+            pfd = contentResolver.openFileDescriptor(uri, "w")
+
+            val r = MediaRecorder(this)
+            // Not: Karşı tarafın sesi için hoparlör modu şart; mikrofon ikisini de alır.
+            r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setOutputFile(pfd!!.fileDescriptor)
+            r.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            r.setVideoSize(w, h)
+            r.setVideoFrameRate(30)
+            r.setVideoEncodingBitRate(3_000_000)
+            r.setAudioEncodingBitRate(128_000)
+            r.setAudioSamplingRate(44_100)
+            r.prepare()
+            recorder = r
+
+            virtualDisplay = mp.createVirtualDisplay(
+                "WhatsAppKayit", w, h, dm.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                r.surface, null, null
+            )
+            r.start()
+
+            kayitVar = true
+            onDurumDegisti?.invoke()
+        } catch (e: Exception) {
+            Log.e(TAG, "Kayıt başlatılamadı", e)
+            Toast.makeText(this, "Kayıt başlatılamadı: ${e.message}", Toast.LENGTH_LONG).show()
+            temizle(silDosya = true)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun yeniDosyaOlustur(): Uri {
+        val ad = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "WhatsApp_$ad.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/WhatsAppKayit")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        return contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Dosya oluşturulamadı")
+    }
+
+    private fun durdur() {
+        if (!kayitVar && recorder == null) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        var basarili = true
+        try {
+            recorder?.stop()
+        } catch (e: RuntimeException) {
+            // Çok kısa kayıtlarda stop() hata verebilir.
+            Log.w(TAG, "stop() hata verdi", e)
+            basarili = false
+        }
+        temizle(silDosya = !basarili)
+        if (basarili) Toast.makeText(this, "Kayıt Filmler/WhatsAppKayit içine kaydedildi", Toast.LENGTH_LONG).show()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun temizle(silDosya: Boolean) {
+        try { recorder?.reset(); recorder?.release() } catch (_: Exception) {}
+        recorder = null
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        virtualDisplay = null
+        try { projection?.stop() } catch (_: Exception) {}
+        projection = null
+        try { pfd?.close() } catch (_: Exception) {}
+        pfd = null
+
+        dosyaUri?.let { uri ->
+            try {
+                if (silDosya) {
+                    contentResolver.delete(uri, null, null)
+                } else {
+                    val v = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                    contentResolver.update(uri, v, null, null)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Dosya sonlandırılamadı", e)
+            }
+        }
+        dosyaUri = null
+        kayitVar = false
+        onDurumDegisti?.invoke()
+    }
+
+    override
