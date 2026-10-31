@@ -89,10 +89,13 @@ class RecorderService : Service() {
 
         try {
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
-            val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+
+            @Suppress("DEPRECATION")
+            val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
                 intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
-            else
-                @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_DATA)
+            } else {
+                intent.getParcelableExtra(EXTRA_DATA)
+            }
             if (data == null) throw IllegalStateException("İzin verisi yok")
 
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -115,7 +118,8 @@ class RecorderService : Service() {
             dosyaUri = uri
             pfd = contentResolver.openFileDescriptor(uri, "w")
 
-            val r = MediaRecorder(this)
+            @Suppress("DEPRECATION")
+            val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
             // Not: Karşı tarafın sesi için hoparlör modu şart; mikrofon ikisini de alır.
             r.setAudioSource(MediaRecorder.AudioSource.MIC)
             r.setVideoSource(MediaRecorder.VideoSource.SURFACE)
@@ -182,13 +186,13 @@ class RecorderService : Service() {
     }
 
     private fun temizle(silDosya: Boolean) {
-        try { recorder?.reset(); recorder?.release() } catch (_: Exception) {}
+        try { recorder?.reset(); recorder?.release() } catch (hata: Exception) {}
         recorder = null
-        try { virtualDisplay?.release() } catch (_: Exception) {}
+        try { virtualDisplay?.release() } catch (hata: Exception) {}
         virtualDisplay = null
-        try { projection?.stop() } catch (_: Exception) {}
+        try { projection?.stop() } catch (hata: Exception) {}
         projection = null
-        try { pfd?.close() } catch (_: Exception) {}
+        try { pfd?.close() } catch (hata: Exception) {}
         pfd = null
 
         dosyaUri?.let { uri ->
